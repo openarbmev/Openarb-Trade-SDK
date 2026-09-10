@@ -20,3 +20,12 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+-------------------------------------------------------------------------------
+Project attribution (informational; the MIT license terms above are unchanged)
+
+Openarb Trade SDK is an independently maintained derivative of
+0xfnzero/sol-trade-sdk: https://github.com/0xfnzero/sol-trade-sdk
+The original authors' work and Git history are preserved. See UPSTREAM.md for
+the imported revision and Openarb changes:
+https://github.com/openarbmev/Openarb-Trade-SDK/blob/main/UPSTREAM.md

@@ -65,11 +65,6 @@ cargo test --workspace
 GitHub Actions 在 Linux 上检查工作区。Devnet 交易测试默认忽略，需主动启用。
 构建检查不能替代真实交易行为验证。
 
-## 许可证与来源
+## 许可证
 
-本项目由 Openarb 独立维护，基于
-[0xfnzero/sol-trade-sdk](https://github.com/0xfnzero/sol-trade-sdk)，保留原始作者的
-Git 历史和版权声明。导入版本和修改范围见 [UPSTREAM.md](UPSTREAM.md)。
-
-采用 [MIT 许可证](LICENSE)。原始版权 © 2024 MiracleAI-Labs；
-Openarb 修改部分版权 © 2026 Openarb。
+采用 [MIT 许可证](LICENSE)。

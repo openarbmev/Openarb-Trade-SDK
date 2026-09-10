@@ -143,12 +143,6 @@ Report reproducible bugs or propose improvements through
 [GitHub Issues](https://github.com/openarbmev/Openarb-Trade-SDK/issues).
 Include the commit, build environment, and sanitized error output.
 
-## License and attribution
+## License
 
-Openarb Trade SDK is an independently maintained derivative of
-[0xfnzero/sol-trade-sdk](https://github.com/0xfnzero/sol-trade-sdk).
-The original authors' work and Git history are preserved. See
-[UPSTREAM.md](UPSTREAM.md) for the imported revision and Openarb changes.
-
-Licensed under [MIT](LICENSE). Copyright © 2024 MiracleAI-Labs;
-Openarb modifications copyright © 2026 Openarb.
+Licensed under [MIT](LICENSE).
