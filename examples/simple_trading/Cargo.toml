@@ -1,0 +1,10 @@
+[package]
+name = "simple_trading"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+openarb-trade-sdk = { path = "../.." }
+solana-commitment-config = { workspace = true }
+solana-sdk = { workspace = true }
+tokio = { version = "1", features = ["full"] }

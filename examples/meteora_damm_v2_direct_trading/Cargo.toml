@@ -1,0 +1,13 @@
+[package]
+name = "meteora_damm_v2_direct_trading"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+openarb-trade-sdk = { path = "../.." }
+solana-streamer-sdk = { workspace = true }
+solana-sdk = { workspace = true }
+solana-commitment-config = { workspace = true }
+tokio = { version = "1", features = ["full"] }
+spl-token-2022 = { version = "11.0.0", features = ["no-entrypoint"] }
+anyhow = "1"

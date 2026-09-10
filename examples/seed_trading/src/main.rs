@@ -1,0 +1,130 @@
+use openarb_trade_sdk::{
+    common::{AnyResult, TradeConfig},
+    swqos::SwqosConfig,
+    trading::{
+        core::params::{DexParamEnum, PumpSwapParams},
+        factory::DexType,
+    },
+    SolanaTrade, TradeTokenType,
+};
+use solana_commitment_config::CommitmentConfig;
+use solana_sdk::pubkey::Pubkey;
+use std::{str::FromStr, sync::Arc};
+
+#[tokio::main]
+async fn main() -> AnyResult<()> {
+    println!("Testing PumpSwap trading...");
+
+    let client = create_solana_trade_client().await?;
+    let slippage_basis_points = Some(100);
+    let recent_blockhash = client.infrastructure.rpc.get_latest_blockhash().await?;
+    let pool = Pubkey::from_str("9qKxzRejsV6Bp2zkefXWCbGvg61c3hHei7ShXJ4FythA").unwrap();
+    let mint_pubkey = Pubkey::from_str("2zMMhcVQEXDtdE6vsFS7S7D5oUodfJHE8vd1gnBouauv").unwrap();
+
+    let gas_fee_strategy = openarb_trade_sdk::common::GasFeeStrategy::new();
+    gas_fee_strategy.set_global_fee_strategy(150000, 150000, 500000, 500000, 0.001, 0.001);
+    let pool_params =
+        PumpSwapParams::from_pool_address_by_rpc(&client.infrastructure.rpc, &pool).await?;
+    let token_program = if pool_params.base_mint == mint_pubkey {
+        pool_params.base_token_program
+    } else if pool_params.quote_mint == mint_pubkey {
+        pool_params.quote_token_program
+    } else {
+        anyhow::bail!("target mint does not belong to the configured pool");
+    };
+    let balance_before =
+        client.get_payer_token_balance_with_program(&mint_pubkey, &token_program).await?;
+
+    // Buy tokens
+    println!("Buying tokens from PumpSwap...");
+    let buy_sol_amount = 100_000;
+    let buy_params = openarb_trade_sdk::TradeBuyParams {
+        dex_type: DexType::PumpSwap,
+        input_token_type: TradeTokenType::WSOL,
+        mint: mint_pubkey,
+        input_token_amount: buy_sol_amount,
+        slippage_basis_points: slippage_basis_points,
+        recent_blockhash: Some(recent_blockhash),
+        extension_params: DexParamEnum::PumpSwap(pool_params),
+        address_lookup_table_accounts: Vec::new(),
+        wait_tx_confirmed: true,
+        wait_for_all_submits: false,
+        create_input_token_ata: true,
+        close_input_token_ata: true,
+        create_mint_ata: true,
+        durable_nonce: None,
+        fixed_output_token_amount: None,
+        gas_fee_strategy: gas_fee_strategy.clone(),
+        simulate: false,
+        use_exact_sol_amount: None,
+        grpc_recv_us: None,
+    };
+    let (ok, sigs, err, _) = client.buy(buy_params).await?;
+    if !ok {
+        anyhow::bail!("buy failed: {:?}; signatures: {:?}", err, sigs);
+    }
+
+    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+
+    // Sell tokens
+    println!("Selling tokens from PumpSwap...");
+
+    let balance_after =
+        client.get_payer_token_balance_with_program(&mint_pubkey, &token_program).await?;
+    let amount_token = balance_after.checked_sub(balance_before).ok_or_else(|| {
+        anyhow::anyhow!("token balance decreased after buy; refusing to sell existing holdings")
+    })?;
+    if amount_token == 0 {
+        anyhow::bail!("confirmed buy did not increase token balance");
+    }
+    let sell_params = openarb_trade_sdk::TradeSellParams {
+        dex_type: DexType::PumpSwap,
+        output_token_type: TradeTokenType::WSOL,
+        mint: mint_pubkey,
+        input_token_amount: amount_token,
+        slippage_basis_points: slippage_basis_points,
+        recent_blockhash: Some(client.infrastructure.rpc.get_latest_blockhash().await?),
+        with_tip: false,
+        extension_params: DexParamEnum::PumpSwap(
+            PumpSwapParams::from_pool_address_by_rpc(&client.infrastructure.rpc, &pool).await?,
+        ),
+        address_lookup_table_accounts: Vec::new(),
+        wait_tx_confirmed: true,
+        wait_for_all_submits: false,
+        create_output_token_ata: true,
+        close_output_token_ata: true,
+        close_mint_token_ata: false,
+        durable_nonce: None,
+        fixed_output_token_amount: None,
+        gas_fee_strategy: gas_fee_strategy,
+        simulate: false,
+        grpc_recv_us: None,
+    };
+    let (ok, sigs, err, _) = client.sell(sell_params).await?;
+    if !ok {
+        anyhow::bail!("sell failed: {:?}; signatures: {:?}", err, sigs);
+    }
+    Ok(())
+}
+
+/// Create SolanaTrade client
+/// Initializes a new SolanaTrade client with configuration
+async fn create_solana_trade_client() -> AnyResult<SolanaTrade> {
+    println!("🚀 Initializing SolanaTrade client...");
+    let payer = openarb_trade_sdk::common::keypair::load_keypair_from_env("PRIVATE_KEY")?;
+    let rpc_url = std::env::var("RPC_URL")
+        .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
+    let commitment = CommitmentConfig::confirmed();
+    let swqos_configs: Vec<SwqosConfig> = vec![SwqosConfig::Default(rpc_url.clone())];
+    let trade_config = TradeConfig::builder(rpc_url, swqos_configs, commitment)
+        // .create_wsol_ata_on_startup(true)  // default: true
+        // .use_seed_optimize(true)            // default: true
+        // .log_enabled(true)                  // default: true
+        // .check_min_tip(false)               // default: false
+        // .swqos_cores_from_end(false)        // default: false
+        // .mev_protection(false)              // default: false
+        .build();
+    let solana_trade = SolanaTrade::new(Arc::new(payer), trade_config).await;
+    println!("✅ SolanaTrade client initialized successfully!");
+    Ok(solana_trade)
+}

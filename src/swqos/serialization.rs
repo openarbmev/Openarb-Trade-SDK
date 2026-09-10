@@ -1,0 +1,451 @@
+//! Transaction serialization module.
+
+use crate::perf::{
+    compiler_optimization::CompileTimeOptimizedEventProcessor, simd::SIMDSerializer,
+};
+use anyhow::Result;
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
+use crossbeam_queue::ArrayQueue;
+use once_cell::sync::Lazy;
+use solana_client::rpc_client::SerializableTransaction;
+use solana_sdk::signature::Signature;
+use solana_transaction_status_client_types::UiTransactionEncoding;
+use std::sync::Arc;
+
+/// Max number of reusable buffers kept in the queue.
+const SERIALIZER_POOL_SIZE: usize = 256;
+/// Solana V1 transactions are capped at 4 KiB; Legacy and V0 are capped at 1232 bytes.
+const SERIALIZER_BUFFER_SIZE: usize = 4 * 1024;
+/// Cold-start prewarm count. Keep small to avoid first-submit spikes.
+const SERIALIZER_PREWARM_BUFFERS: usize = 64;
+
+/// Zero-allocation serializer using a buffer pool to avoid runtime allocation.
+pub struct ZeroAllocSerializer {
+    buffer_pool: Arc<ArrayQueue<Vec<u8>>>,
+    buffer_size: usize,
+}
+
+impl ZeroAllocSerializer {
+    pub fn new(pool_size: usize, buffer_size: usize) -> Self {
+        Self::new_with_prewarm(pool_size, buffer_size, SERIALIZER_PREWARM_BUFFERS)
+    }
+
+    fn new_with_prewarm(pool_size: usize, buffer_size: usize, prewarm_buffers: usize) -> Self {
+        let pool = ArrayQueue::new(pool_size);
+        let prewarm_count = prewarm_buffers.min(pool_size);
+
+        // Prewarm only a small hot set to avoid large cold-start blocking.
+        // Remaining buffers are allocated lazily and returned to this pool.
+        for _ in 0..prewarm_count {
+            let _ = pool.push(Vec::with_capacity(buffer_size));
+        }
+
+        Self { buffer_pool: Arc::new(pool), buffer_size }
+    }
+
+    pub fn serialize_zero_alloc<T: serde::Serialize>(
+        &self,
+        data: &T,
+        _label: &str,
+    ) -> Result<Vec<u8>> {
+        let mut buffer =
+            self.buffer_pool.pop().unwrap_or_else(|| Vec::with_capacity(self.buffer_size));
+        buffer.clear();
+        if let Err(error) = bincode::serialize_into(&mut buffer, data) {
+            self.return_buffer(buffer);
+            return Err(error.into());
+        }
+        Ok(buffer)
+    }
+
+    pub fn serialize_transaction<T: SerializableTransaction>(
+        &self,
+        transaction: &T,
+    ) -> Result<Vec<u8>> {
+        let mut buffer =
+            self.buffer_pool.pop().unwrap_or_else(|| Vec::with_capacity(self.buffer_size));
+        buffer.clear();
+        if let Err(error) = wincode::serialize_into(&mut buffer, transaction) {
+            self.return_buffer(buffer);
+            return Err(error.into());
+        }
+        Ok(buffer)
+    }
+
+    pub fn return_buffer(&self, buffer: Vec<u8>) {
+        // Do not let an atypically large generic payload permanently inflate the hot pool.
+        if buffer.capacity() <= self.buffer_size {
+            let _ = self.buffer_pool.push(buffer);
+        }
+    }
+
+    /// Get pool statistics.
+    pub fn get_pool_stats(&self) -> (usize, usize) {
+        let available = self.buffer_pool.len();
+        let capacity = self.buffer_pool.capacity();
+        (available, capacity)
+    }
+}
+
+/// Global serializer instance.
+static SERIALIZER: Lazy<Arc<ZeroAllocSerializer>> =
+    Lazy::new(|| Arc::new(ZeroAllocSerializer::new(SERIALIZER_POOL_SIZE, SERIALIZER_BUFFER_SIZE)));
+
+/// Compile-time optimized event processor (zero runtime cost).
+static COMPILE_TIME_PROCESSOR: CompileTimeOptimizedEventProcessor =
+    CompileTimeOptimizedEventProcessor::new();
+
+/// Base64 encoder.
+pub struct Base64Encoder;
+
+impl Base64Encoder {
+    #[inline(always)]
+    pub fn encode(data: &[u8]) -> String {
+        // Use compile-time optimized hash for fast routing
+        let _route = if !data.is_empty() {
+            COMPILE_TIME_PROCESSOR.route_event_zero_cost(data[0])
+        } else {
+            0
+        };
+
+        // Use SIMD-accelerated Base64 encoding
+        SIMDSerializer::encode_base64_simd(data)
+    }
+
+    #[inline(always)]
+    pub fn serialize_and_encode<T: serde::Serialize>(
+        value: &T,
+        event_type: &str,
+    ) -> Result<String> {
+        let serialized = SERIALIZER.serialize_zero_alloc(value, event_type)?;
+        let encoded = STANDARD.encode(&serialized);
+        SERIALIZER.return_buffer(serialized);
+        Ok(encoded)
+    }
+}
+
+/// Guard that returns the serialization buffer to the pool on drop.
+pub struct PooledTxBufGuard(pub Vec<u8>);
+
+impl std::ops::Deref for PooledTxBufGuard {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl AsRef<[u8]> for PooledTxBufGuard {
+    #[inline(always)]
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Drop for PooledTxBufGuard {
+    fn drop(&mut self) {
+        if !self.0.is_empty() {
+            SERIALIZER.return_buffer(std::mem::take(&mut self.0));
+        }
+    }
+}
+
+/// Serialize a transaction with wincode into a pooled, Solana wire-compatible byte buffer.
+///
+/// The public name retains `bincode` for API compatibility. The returned guard sends the buffer
+/// back to the pool when dropped; use `&*guard` or `guard.as_ref()` for `&[u8]`.
+pub fn serialize_transaction_bincode_sync(
+    transaction: &impl SerializableTransaction,
+) -> Result<(PooledTxBufGuard, Signature)> {
+    let signature = transaction.get_signature();
+    let serialized_tx = SERIALIZER.serialize_transaction(transaction)?;
+    Ok((PooledTxBufGuard(serialized_tx), *signature))
+}
+
+/// Return a buffer to the pool (for manual use when not using `PooledTxBufGuard`).
+pub fn return_serialization_buffer(buffer: Vec<u8>) {
+    SERIALIZER.return_buffer(buffer);
+}
+
+#[inline]
+fn validate_binary_encoding(encoding: UiTransactionEncoding) -> Result<()> {
+    if matches!(encoding, UiTransactionEncoding::Base58 | UiTransactionEncoding::Base64) {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("Unsupported encoding"))
+    }
+}
+
+/// Sync serialize + encode using buffer pool; use in hot path to reduce allocs.
+/// Base64 path uses SIMD-accelerated encoding.
+pub fn serialize_transaction_sync(
+    transaction: &impl SerializableTransaction,
+    encoding: UiTransactionEncoding,
+) -> Result<(String, Signature)> {
+    validate_binary_encoding(encoding)?;
+    let signature = transaction.get_signature();
+    let serialized_tx = SERIALIZER.serialize_transaction(transaction)?;
+    let serialized = match encoding {
+        UiTransactionEncoding::Base58 => bs58::encode(&serialized_tx).into_string(),
+        UiTransactionEncoding::Base64 => SIMDSerializer::encode_base64_simd(&serialized_tx),
+        _ => unreachable!("encoding validated above"),
+    };
+    SERIALIZER.return_buffer(serialized_tx);
+    Ok((serialized, *signature))
+}
+
+/// Serialize a transaction (async; no I/O, kept for API compatibility).
+pub async fn serialize_transaction(
+    transaction: &impl SerializableTransaction,
+    encoding: UiTransactionEncoding,
+) -> Result<(String, Signature)> {
+    validate_binary_encoding(encoding)?;
+    let signature = transaction.get_signature();
+
+    // Use zero-allocation serialization
+    let serialized_tx = SERIALIZER.serialize_transaction(transaction)?;
+
+    let serialized = match encoding {
+        UiTransactionEncoding::Base58 => bs58::encode(&serialized_tx).into_string(),
+        UiTransactionEncoding::Base64 => SIMDSerializer::encode_base64_simd(&serialized_tx),
+        _ => unreachable!("encoding validated above"),
+    };
+
+    // Return buffer to pool immediately
+    SERIALIZER.return_buffer(serialized_tx);
+
+    Ok((serialized, *signature))
+}
+
+/// Sync batch serialize + encode using buffer pool.
+pub fn serialize_transactions_batch_sync(
+    transactions: &[impl SerializableTransaction],
+    encoding: UiTransactionEncoding,
+) -> Result<Vec<String>> {
+    validate_binary_encoding(encoding)?;
+    let mut results = Vec::with_capacity(transactions.len());
+    for tx in transactions {
+        let serialized_tx = SERIALIZER.serialize_transaction(tx)?;
+        let encoded = match encoding {
+            UiTransactionEncoding::Base58 => bs58::encode(&serialized_tx).into_string(),
+            UiTransactionEncoding::Base64 => SIMDSerializer::encode_base64_simd(&serialized_tx),
+            _ => unreachable!("encoding validated above"),
+        };
+        SERIALIZER.return_buffer(serialized_tx);
+        results.push(encoded);
+    }
+    Ok(results)
+}
+
+/// Batch transaction serialization.
+pub async fn serialize_transactions_batch(
+    transactions: &[impl SerializableTransaction],
+    encoding: UiTransactionEncoding,
+) -> Result<Vec<String>> {
+    validate_binary_encoding(encoding)?;
+    let mut results = Vec::with_capacity(transactions.len());
+
+    for tx in transactions {
+        let serialized_tx = SERIALIZER.serialize_transaction(tx)?;
+
+        let encoded = match encoding {
+            UiTransactionEncoding::Base58 => bs58::encode(&serialized_tx).into_string(),
+            UiTransactionEncoding::Base64 => SIMDSerializer::encode_base64_simd(&serialized_tx),
+            _ => unreachable!("encoding validated above"),
+        };
+
+        SERIALIZER.return_buffer(serialized_tx);
+        results.push(encoded);
+    }
+
+    Ok(results)
+}
+
+/// Get serializer statistics.
+pub fn get_serializer_stats() -> (usize, usize) {
+    SERIALIZER.get_pool_stats()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solana_sdk::{
+        message::{legacy::Message, v0, v1, VersionedMessage},
+        transaction::{Transaction, VersionedTransaction},
+    };
+    use std::time::Instant;
+
+    #[test]
+    fn test_base64_encode() {
+        let data = b"Hello, World!";
+        let encoded = Base64Encoder::encode(data);
+        assert!(!encoded.is_empty());
+
+        // Verify it decodes correctly
+        let decoded = STANDARD.decode(&encoded).unwrap();
+        assert_eq!(&decoded[..data.len()], data);
+    }
+
+    #[test]
+    fn test_serializer_stats() {
+        let (available, capacity) = get_serializer_stats();
+        assert!(available <= capacity);
+        assert_eq!(capacity, SERIALIZER_POOL_SIZE);
+    }
+
+    #[test]
+    fn test_serializer_prewarm_is_bounded() {
+        let serializer = ZeroAllocSerializer::new_with_prewarm(128, 1024, 8);
+        let (available, capacity) = serializer.get_pool_stats();
+        assert_eq!(capacity, 128);
+        assert_eq!(available, 8);
+    }
+
+    #[test]
+    fn test_serializer_lazy_alloc_and_return() {
+        let serializer = ZeroAllocSerializer::new_with_prewarm(8, 1024, 0);
+        let (available_before, capacity) = serializer.get_pool_stats();
+        assert_eq!(capacity, 8);
+        assert_eq!(available_before, 0);
+
+        let buf = serializer.serialize_zero_alloc(&"hello", "test").unwrap();
+        assert!(buf.capacity() >= 1024);
+        serializer.return_buffer(buf);
+
+        let (available_after, _) = serializer.get_pool_stats();
+        assert_eq!(available_after, 1);
+    }
+
+    #[test]
+    fn oversized_buffer_is_not_retained() {
+        let serializer = ZeroAllocSerializer::new_with_prewarm(8, 64, 0);
+        serializer.return_buffer(Vec::with_capacity(65));
+        assert_eq!(serializer.get_pool_stats(), (0, 8));
+    }
+
+    fn assert_pooled_wincode_matches<T: SerializableTransaction>(transaction: &T) {
+        let expected = wincode::serialize(transaction).unwrap();
+        let serializer = ZeroAllocSerializer::new_with_prewarm(1, 1232, 1);
+        let actual = serializer.serialize_transaction(transaction).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_wincode_transaction_bytes_match_wire_formats() {
+        let legacy = VersionedTransaction {
+            signatures: vec![Signature::default()],
+            message: VersionedMessage::Legacy(Message::default()),
+        };
+        assert_eq!(wincode::serialize(&legacy).unwrap(), bincode::serialize(&legacy).unwrap());
+        assert_pooled_wincode_matches(&legacy);
+
+        let v0 = VersionedTransaction {
+            signatures: vec![Signature::default()],
+            message: VersionedMessage::V0(v0::Message::default()),
+        };
+        assert_eq!(wincode::serialize(&v0).unwrap(), bincode::serialize(&v0).unwrap());
+        assert_pooled_wincode_matches(&v0);
+
+        // V1 has its own 4KB wire format and intentionally is not bincode-compatible.
+        let v1 = VersionedTransaction {
+            signatures: vec![Signature::default()],
+            message: VersionedMessage::V1(v1::Message::default()),
+        };
+        assert_pooled_wincode_matches(&v1);
+
+        let legacy_transaction = Transaction::default();
+        assert_eq!(
+            wincode::serialize(&legacy_transaction).unwrap(),
+            bincode::serialize(&legacy_transaction).unwrap()
+        );
+        assert_pooled_wincode_matches(&legacy_transaction);
+    }
+
+    #[test]
+    fn unsupported_encoding_is_rejected_before_pool_use() {
+        assert!(validate_binary_encoding(UiTransactionEncoding::Json).is_err());
+        assert!(validate_binary_encoding(UiTransactionEncoding::JsonParsed).is_err());
+        assert!(validate_binary_encoding(UiTransactionEncoding::Base64).is_ok());
+    }
+
+    fn legacy_eager_zero_fill_serializer(
+        pool_size: usize,
+        buffer_size: usize,
+    ) -> ZeroAllocSerializer {
+        let pool = ArrayQueue::new(pool_size);
+        for _ in 0..pool_size {
+            let mut buffer = Vec::with_capacity(buffer_size);
+            buffer.resize(buffer_size, 0);
+            let _ = pool.push(buffer);
+        }
+        ZeroAllocSerializer { buffer_pool: Arc::new(pool), buffer_size }
+    }
+
+    /// Manual perf test: compares old eager cold-start behavior to current bounded prewarm.
+    /// Run with:
+    /// cargo test --release perf_serializer_cold_start_vs_legacy_eager -- --ignored --nocapture
+    #[test]
+    #[ignore = "manual perf benchmark"]
+    fn perf_serializer_cold_start_vs_legacy_eager() {
+        const POOL_SIZE: usize = 4096;
+        const BUFFER_SIZE: usize = 32 * 1024;
+        const PREWARM: usize = 64;
+        let payload = vec![7u8; 4096];
+
+        let legacy_init_start = Instant::now();
+        let legacy = legacy_eager_zero_fill_serializer(POOL_SIZE, BUFFER_SIZE);
+        let legacy_init = legacy_init_start.elapsed();
+
+        let current_init_start = Instant::now();
+        let current = ZeroAllocSerializer::new_with_prewarm(POOL_SIZE, BUFFER_SIZE, PREWARM);
+        let current_init = current_init_start.elapsed();
+
+        let legacy_first_start = Instant::now();
+        let legacy_buf = legacy.serialize_zero_alloc(&payload, "perf").unwrap();
+        let legacy_first = legacy_first_start.elapsed();
+        legacy.return_buffer(legacy_buf);
+
+        let current_first_start = Instant::now();
+        let current_buf = current.serialize_zero_alloc(&payload, "perf").unwrap();
+        let current_first = current_first_start.elapsed();
+        current.return_buffer(current_buf);
+
+        println!(
+            "[perf] serializer cold-start compare\n  pool_size={POOL_SIZE} buffer_size={BUFFER_SIZE} prewarm={PREWARM}\n  legacy_init={legacy_init:?} current_init={current_init:?}\n  legacy_first_serialize={legacy_first:?} current_first_serialize={current_first:?}"
+        );
+
+        assert!(
+            current_init <= legacy_init,
+            "expected bounded prewarm init ({current_init:?}) to be <= legacy eager init ({legacy_init:?})"
+        );
+    }
+
+    /// Manual perf test: demonstrates lazy allocation amortization.
+    /// Run with:
+    /// cargo test --release perf_serializer_lazy_growth_amortization -- --ignored --nocapture
+    #[test]
+    #[ignore = "manual perf benchmark"]
+    fn perf_serializer_lazy_growth_amortization() {
+        const POOL_SIZE: usize = 128;
+        const BUFFER_SIZE: usize = 256 * 1024;
+        let serializer = ZeroAllocSerializer::new_with_prewarm(POOL_SIZE, BUFFER_SIZE, 0);
+        let payload = vec![1u8; 8 * 1024];
+
+        let first_start = Instant::now();
+        let first_buf = serializer.serialize_zero_alloc(&payload, "perf").unwrap();
+        let first = first_start.elapsed();
+        serializer.return_buffer(first_buf);
+
+        let second_start = Instant::now();
+        let second_buf = serializer.serialize_zero_alloc(&payload, "perf").unwrap();
+        let second = second_start.elapsed();
+        serializer.return_buffer(second_buf);
+
+        let (available, capacity) = serializer.get_pool_stats();
+        println!(
+            "[perf] serializer lazy growth\n  pool_size={POOL_SIZE} buffer_size={BUFFER_SIZE}\n  first_serialize={first:?} second_serialize={second:?}\n  available={available} capacity={capacity}"
+        );
+        assert!(available >= 1);
+        assert_eq!(capacity, POOL_SIZE);
+    }
+}

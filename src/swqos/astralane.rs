@@ -1,0 +1,353 @@
+use crate::swqos::common::{default_http_client_builder, poll_transaction_confirmation};
+use rand::seq::IndexedRandom;
+use reqwest::Client;
+use std::{sync::Arc, time::Instant};
+use tracing::warn;
+
+use crate::swqos::SwqosClientTrait;
+use crate::swqos::{SwqosType, TradeType};
+use anyhow::Result;
+use solana_client::rpc_client::SerializableTransaction;
+use solana_sdk::transaction::VersionedTransaction;
+use std::time::Duration;
+use wincode::serialize as wincode_serialize;
+
+use crate::{common::SolanaRpcClient, constants::swqos::ASTRALANE_TIP_ACCOUNTS};
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::task::JoinHandle;
+
+/// Empty body for getHealth POST; avoid per-request allocation.
+static PING_BODY: &[u8] = &[];
+
+use crate::swqos::astralane_quic::AstralaneQuicClient;
+
+#[derive(Clone)]
+pub enum AstralaneBackend {
+    Http {
+        endpoint: String,
+        auth_token: String,
+        /// Mirrors global `mev_protection`: adds `mev-protect=true` on HTTP sends (QUIC uses :9000 instead).
+        mev_http: bool,
+        http_client: Client,
+        ping_handle: Arc<tokio::sync::Mutex<Option<JoinHandle<()>>>>,
+        stop_ping: Arc<AtomicBool>,
+    },
+    Quic(Arc<AstralaneQuicClient>),
+    QuicWithHttpFallback {
+        quic: Arc<AstralaneQuicClient>,
+        endpoint: String,
+        auth_token: String,
+        mev_http: bool,
+        http_client: Client,
+        ping_handle: Arc<tokio::sync::Mutex<Option<JoinHandle<()>>>>,
+        stop_ping: Arc<AtomicBool>,
+    },
+}
+
+#[derive(Clone)]
+pub struct AstralaneClient {
+    pub rpc_client: Arc<SolanaRpcClient>,
+    backend: AstralaneBackend,
+}
+
+#[async_trait::async_trait]
+impl SwqosClientTrait for AstralaneClient {
+    async fn send_transaction(
+        &self,
+        trade_type: TradeType,
+        transaction: &VersionedTransaction,
+        wait_confirmation: bool,
+    ) -> Result<()> {
+        self.send_transaction_impl(trade_type, transaction, wait_confirmation).await
+    }
+
+    async fn send_transactions(
+        &self,
+        trade_type: TradeType,
+        transactions: &Vec<VersionedTransaction>,
+        wait_confirmation: bool,
+    ) -> Result<()> {
+        for transaction in transactions {
+            self.send_transaction_impl(trade_type, transaction, wait_confirmation).await?;
+        }
+        Ok(())
+    }
+
+    fn get_tip_account(&self) -> Result<String> {
+        let tip_account = *ASTRALANE_TIP_ACCOUNTS
+            .choose(&mut rand::rng())
+            .or_else(|| ASTRALANE_TIP_ACCOUNTS.first())
+            .unwrap();
+        Ok(tip_account.to_string())
+    }
+
+    fn get_swqos_type(&self) -> SwqosType {
+        SwqosType::Astralane
+    }
+}
+
+impl AstralaneClient {
+    /// HTTP 提交：`/iris`（Plain）或 `/irisb`（Binary），由 `endpoint` URL 路径区分；`mev_http` 为 true 时附加 `mev-protect=true`。
+    pub fn new(rpc_url: String, endpoint: String, auth_token: String, mev_http: bool) -> Self {
+        let rpc_client = SolanaRpcClient::new(rpc_url);
+        let http_client = default_http_client_builder().build().unwrap();
+        let ping_handle = Arc::new(tokio::sync::Mutex::new(None));
+        let stop_ping = Arc::new(AtomicBool::new(false));
+
+        let client = Self {
+            rpc_client: Arc::new(rpc_client),
+            backend: AstralaneBackend::Http {
+                endpoint,
+                auth_token,
+                mev_http,
+                http_client,
+                ping_handle,
+                stop_ping,
+            },
+        };
+        let client_clone = client.clone();
+        tokio::spawn(async move {
+            client_clone.start_ping_task().await;
+        });
+        client
+    }
+
+    /// 使用 QUIC 提交。
+    pub async fn new_quic(rpc_url: String, quic_endpoint: &str, api_key: String) -> Result<Self> {
+        let rpc_client = SolanaRpcClient::new(rpc_url);
+        let quic_client = AstralaneQuicClient::connect(quic_endpoint, &api_key).await?;
+        Ok(Self {
+            rpc_client: Arc::new(rpc_client),
+            backend: AstralaneBackend::Quic(Arc::new(quic_client)),
+        })
+    }
+
+    /// Default path: persistent QUIC, with a warm Binary HTTP fallback.
+    pub async fn new_quic_with_http_fallback(
+        rpc_url: String,
+        quic_endpoint: &str,
+        http_endpoint: String,
+        api_key: String,
+        mev_http: bool,
+    ) -> Result<Self> {
+        let quic_client = AstralaneQuicClient::connect(quic_endpoint, &api_key).await?;
+        let client = Self {
+            rpc_client: Arc::new(SolanaRpcClient::new(rpc_url)),
+            backend: AstralaneBackend::QuicWithHttpFallback {
+                quic: Arc::new(quic_client),
+                endpoint: http_endpoint,
+                auth_token: api_key,
+                mev_http,
+                http_client: default_http_client_builder().build().unwrap(),
+                ping_handle: Arc::new(tokio::sync::Mutex::new(None)),
+                stop_ping: Arc::new(AtomicBool::new(false)),
+            },
+        };
+        let client_clone = client.clone();
+        tokio::spawn(async move {
+            client_clone.start_ping_task().await;
+        });
+        Ok(client)
+    }
+
+    async fn start_ping_task(&self) {
+        match &self.backend {
+            AstralaneBackend::Http {
+                endpoint,
+                auth_token,
+                http_client,
+                ping_handle,
+                stop_ping,
+                ..
+            }
+            | AstralaneBackend::QuicWithHttpFallback {
+                endpoint,
+                auth_token,
+                http_client,
+                ping_handle,
+                stop_ping,
+                ..
+            } => {
+                let endpoint = endpoint.clone();
+                let auth_token = auth_token.clone();
+                let http_client = http_client.clone();
+                let ping_handle = ping_handle.clone();
+                let stop_ping = stop_ping.clone();
+                let handle = tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(Duration::from_secs(30));
+                    loop {
+                        interval.tick().await;
+                        if stop_ping.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        if let Err(e) =
+                            Self::send_ping_request(&http_client, &endpoint, &auth_token).await
+                        {
+                            warn!(target: "openarb_trade_sdk", "Astralane ping request failed: {}", e);
+                        }
+                    }
+                });
+                let mut guard = ping_handle.lock().await;
+                if let Some(old) = guard.as_ref() {
+                    old.abort();
+                }
+                *guard = Some(handle);
+            }
+            AstralaneBackend::Quic(_) => {}
+        }
+    }
+
+    /// Send ping request: POST endpoint?api-key=...&method=getHealth
+    async fn send_ping_request(
+        http_client: &Client,
+        endpoint: &str,
+        auth_token: &str,
+    ) -> Result<()> {
+        let response = http_client
+            .post(endpoint)
+            .query(&[("api-key", auth_token), ("method", "getHealth")])
+            .timeout(Duration::from_millis(1500))
+            .body(PING_BODY)
+            .send()
+            .await?;
+        let status = response.status();
+        let _ = response.bytes().await;
+        if !status.is_success() {
+            warn!(target: "openarb_trade_sdk", "Astralane ping request returned non-success status: {}", status);
+        }
+        Ok(())
+    }
+
+    async fn submit_http(
+        http_client: &Client,
+        endpoint: &str,
+        auth_token: &str,
+        mev_http: bool,
+        body_bytes: Vec<u8>,
+    ) -> Result<()> {
+        let mut request = http_client
+            .post(endpoint)
+            .query(&[("api-key", auth_token), ("method", "sendTransaction")]);
+        if mev_http {
+            request = request.query(&[("mev-protect", "true")]);
+        }
+        let response = request
+            .header("Content-Type", "application/octet-stream")
+            .body(body_bytes)
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!(
+                "Astralane HTTP sendTransaction failed: status {} body: {}",
+                status,
+                body
+            );
+        }
+        Ok(())
+    }
+
+    fn should_fallback_quic(error: &anyhow::Error) -> bool {
+        let message = error.to_string().to_ascii_lowercase();
+        !message.contains("unknown api key")
+            && !message.contains("connection limit")
+            && !message.contains("transaction too large")
+    }
+
+    async fn send_transaction_impl(
+        &self,
+        trade_type: TradeType,
+        transaction: &VersionedTransaction,
+        wait_confirmation: bool,
+    ) -> Result<()> {
+        let start_time = Instant::now();
+        let signature = transaction.get_signature();
+        let body_bytes = wincode_serialize(transaction)
+            .map_err(|e| anyhow::anyhow!("Astralane binary serialize failed: {}", e))?;
+
+        match &self.backend {
+            AstralaneBackend::Http { endpoint, auth_token, mev_http, http_client, .. } => {
+                Self::submit_http(http_client, endpoint, auth_token, *mev_http, body_bytes).await?;
+            }
+            AstralaneBackend::Quic(quic) => {
+                quic.send_transaction(&body_bytes).await?;
+            }
+            AstralaneBackend::QuicWithHttpFallback {
+                quic,
+                endpoint,
+                auth_token,
+                mev_http,
+                http_client,
+                ..
+            } => {
+                if let Err(error) = quic.send_transaction(&body_bytes).await {
+                    if !Self::should_fallback_quic(&error) {
+                        return Err(error);
+                    }
+                    tracing::warn!(target: "openarb_trade_sdk", "Astralane QUIC submit failed; using Binary HTTP fallback: {error}");
+                    Self::submit_http(http_client, endpoint, auth_token, *mev_http, body_bytes)
+                        .await?;
+                }
+            }
+        }
+
+        if crate::common::sdk_log::sdk_log_enabled() {
+            crate::common::sdk_log::log_swqos_submitted(
+                "Astralane",
+                trade_type,
+                start_time.elapsed(),
+            );
+        }
+
+        let start_time = Instant::now();
+        match poll_transaction_confirmation(&self.rpc_client, *signature, wait_confirmation).await {
+            Ok(_) => (),
+            Err(e) => {
+                if crate::common::sdk_log::sdk_log_enabled() {
+                    println!(" signature: {:?}", signature);
+                    println!(
+                        " [{:width$}] {} confirmation failed: {:?}",
+                        "Astralane",
+                        trade_type,
+                        start_time.elapsed(),
+                        width = crate::common::sdk_log::SWQOS_LABEL_WIDTH
+                    );
+                }
+                return Err(e);
+            }
+        }
+        if wait_confirmation && crate::common::sdk_log::sdk_log_enabled() {
+            println!(" signature: {:?}", signature);
+            println!(
+                " [{:width$}] {} confirmed: {:?}",
+                "Astralane",
+                trade_type,
+                start_time.elapsed(),
+                width = crate::common::sdk_log::SWQOS_LABEL_WIDTH
+            );
+        }
+        Ok(())
+    }
+}
+
+impl Drop for AstralaneClient {
+    fn drop(&mut self) {
+        match &self.backend {
+            AstralaneBackend::Http { stop_ping, ping_handle, .. }
+            | AstralaneBackend::QuicWithHttpFallback { stop_ping, ping_handle, .. } => {
+                stop_ping.store(true, Ordering::Relaxed);
+                let ping_handle = ping_handle.clone();
+                tokio::spawn(async move {
+                    let mut guard = ping_handle.lock().await;
+                    if let Some(handle) = guard.as_ref() {
+                        handle.abort();
+                    }
+                    *guard = None;
+                });
+            }
+            AstralaneBackend::Quic(_) => {}
+        }
+    }
+}

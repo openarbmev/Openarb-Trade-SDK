@@ -1,0 +1,20 @@
+# Proto 生成工具和生成的代码（用户不需要）
+/proto/gen/
+
+# 预生成的 proto Rust 代码（提交到仓库，但用户不应修改）
+# /src/swqos/pb/serverpb.rs  <- 这个文件已经提交，用户不应修改
+
+# Build artifacts
+/target/
+Cargo.lock
+.DS_Store
+
+# Proto sources
+/proto/
+
+# Local credentials and environment files
+.env
+.env.*
+!.env.example
+.rebrand.py
+.verify_rebrand.py

@@ -1,0 +1,35 @@
+# 推送 tag（如 v3.4.1）时自动创建 GitHub Release
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get version from tag
+        id: tag
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: v${{ steps.tag.outputs.VERSION }}
+          body: |
+            ## openarb-trade-sdk ${{ steps.tag.outputs.VERSION }}
+            Rust SDK to interact with the dex trade Solana program (Pump.fun, Raydium, etc.).
+            - **Cargo**: `openarb-trade-sdk = { git = "https://github.com/${{ github.repository }}", tag = "v${{ steps.tag.outputs.VERSION }}" }`
+          draft: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

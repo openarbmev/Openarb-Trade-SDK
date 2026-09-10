@@ -1,0 +1,11 @@
+[package]
+name = "wsol_wrapper"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+openarb-trade-sdk = { path = "../.." }
+solana-sdk = { workspace = true }
+solana-commitment-config = { workspace = true }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1.0"

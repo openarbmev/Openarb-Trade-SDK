@@ -1,0 +1,12 @@
+[package]
+name = "seed_trading"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+openarb-trade-sdk = { path = "../.." }
+solana-streamer-sdk = { workspace = true }
+solana-sdk = { workspace = true }
+solana-commitment-config = { workspace = true }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
