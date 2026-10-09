@@ -16,7 +16,7 @@ for your own bots, trading tools, and infrastructure.
 | --- | --- |
 | DEX integrations | PumpFun, PumpSwap, Bonk, Raydium AMM v4, Raydium CPMM, Meteora DAMM v2 |
 | Trading interface | Buy and sell parameters, slippage, account policies, and protocol-specific state |
-| Transaction delivery | Solana RPC and configurable relay clients including Jito, Temporal, Bloxroute, Astralane, Glaive, and others |
+| Transaction delivery | Solana RPC and configurable relay clients including Jito, Temporal, Bloxroute, Astralane, Glaive, OrbitFlare Apex, and others |
 | Transaction controls | Priority fees, relay tips, address lookup tables, durable nonces, and middleware |
 | Shared infrastructure | Reuse RPC and submission clients across multiple wallets |
 | Integration tools | Pool and price utilities, risk-gate hooks, and workspace examples |

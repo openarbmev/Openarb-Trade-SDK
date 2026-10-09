@@ -12,7 +12,7 @@ Openarb Trade SDK 提供统一的交易参数、DEX 指令构建以及 RPC 和�
 
 - 支持 PumpFun、PumpSwap、Bonk、Raydium AMM v4、Raydium CPMM 和 Meteora DAMM v2。
 - 提供买卖参数、滑点设置、账户策略和协议状态接口。
-- 支持 Solana RPC 及 Jito、Temporal、Bloxroute、Astralane、Glaive 等提交服务。
+- 支持 Solana RPC 及 Jito、Temporal、Bloxroute、Astralane、Glaive、OrbitFlare Apex 等提交服务。
 - 提供优先费、小费、地址查找表、持久化 Nonce、中间件及多钱包共享基础设施。
 
 应用需要自行提供交易策略、钱包管理、行情数据及最新协议状态。
